@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Card Scanner</title>
+  <meta name="theme-color" content="#101418">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Card Scanner">
+  <link rel="apple-touch-icon" href="icons/icon-180.png">
+  <link rel="icon" href="icons/icon-192.png">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="top">
+    <div class="title-row">
+      <h1>Card Scanner</h1>
+      <button id="btn-settings" class="icon-btn" aria-label="Settings">
+        <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M19.4 13a7.5 7.5 0 0 0 0-2l2-1.6-2-3.4-2.4 1a7.6 7.6 0 0 0-1.7-1L15 3.5h-4l-.4 2.5a7.6 7.6 0 0 0-1.7 1l-2.4-1-2 3.4 2 1.6a7.5 7.5 0 0 0 0 2l-2 1.6 2 3.4 2.4-1c.5.4 1.1.7 1.7 1l.4 2.5h4l.4-2.5c.6-.3 1.2-.6 1.7-1l2.4 1 2-3.4-2-1.6ZM13 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7Z" transform="translate(-1 0)"/></svg>
+      </button>
+    </div>
+    <div class="summary">
+      <div><span id="sum-count">0</span> cards</div>
+      <div class="sum-value"><span class="muted">Total market</span> <strong id="sum-value">$0.00</strong></div>
+    </div>
+    <div id="data-status" class="data-status muted">Loading price data…</div>
+  </header>
+
+  <main>
+    <div id="busy" class="busy" hidden>
+      <div class="spinner"></div><span id="busy-text">Reading card…</span>
+    </div>
+    <div id="error" class="error" hidden></div>
+    <section id="list" class="list" aria-live="polite"></section>
+    <div id="empty" class="empty">
+      <p><strong>Scan a card to start your list.</strong></p>
+      <p class="muted">Lay the card flat in good light so the name and the number at the bottom are readable. You can photograph several cards at once.</p>
+    </div>
+  </main>
+
+  <footer class="bottom">
+    <label class="btn primary scan">
+      <input id="in-camera" type="file" accept="image/*" capture="environment" hidden>
+      <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M9 3 7.2 5H4a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-3.2L15 3H9Zm3 5a5 5 0 1 1 0 10 5 5 0 0 1 0-10Zm0 2a3 3 0 1 0 0 6 3 3 0 0 0 0-6Z"/></svg>
+      Scan card
+    </label>
+    <label class="btn secondary">
+      <input id="in-library" type="file" accept="image/*" multiple hidden>
+      Photos
+    </label>
+    <button id="btn-search" class="btn secondary">Search</button>
+  </footer>
+
+  <!-- Pick / change match -->
+  <dialog id="dlg-pick" class="sheet">
+    <form method="dialog" class="sheet-head">
+      <h2 id="pick-title">Choose the right card</h2>
+      <button class="icon-btn" aria-label="Close">✕</button>
+    </form>
+    <div id="pick-detected" class="muted small"></div>
+    <div class="row">
+      <select id="pick-game" aria-label="Game">
+        <option value="pokemon">Pokémon</option>
+        <option value="pokemon-jp">Pokémon (Japanese)</option>
+        <option value="onepiece">One Piece</option>
+      </select>
+      <input id="pick-query" type="search" placeholder="Name, number or set" autocomplete="off">
+    </div>
+    <div id="pick-results" class="pick-results"></div>
+  </dialog>
+
+  <!-- PSA link -->
+  <dialog id="dlg-psa" class="sheet">
+    <form method="dialog" class="sheet-head">
+      <h2>Link PSA population</h2>
+      <button class="icon-btn" aria-label="Close">✕</button>
+    </form>
+    <p id="psa-card" class="small"></p>
+    <p class="small muted">PSA can't be searched by card name, so link this card once using the <strong>cert number of any PSA-graded copy of this exact card</strong>. eBay listing photos show it on the slab label. After that, PSA 9 and 10 counts update on their own.</p>
+    <div class="row">
+      <input id="psa-cert" inputmode="numeric" placeholder="PSA cert number, e.g. 87654321">
+    </div>
+    <div class="row">
+      <a id="psa-find" class="btn secondary small-btn" target="_blank" rel="noopener">Find a graded copy on eBay</a>
+    </div>
+    <div class="row end">
+      <button id="psa-unlink" class="btn ghost" hidden>Unlink</button>
+      <button id="psa-save" class="btn primary">Save link</button>
+    </div>
+    <p id="psa-msg" class="small"></p>
+  </dialog>
+
+  <!-- Settings -->
+  <dialog id="dlg-settings" class="sheet">
+    <form method="dialog" class="sheet-head">
+      <h2>Settings</h2>
+      <button class="icon-btn" aria-label="Close">✕</button>
+    </form>
+    <label class="field">Claude AI API key <span class="muted">(reads your cards)</span>
+      <input id="set-key" type="password" autocomplete="off" placeholder="sk-ant-…">
+    </label>
+    <label class="field">Card reading model
+      <select id="set-model">
+        <option value="claude-sonnet-5-5">Sonnet 5.5 (recommended)</option>
+        <option value="claude-haiku-5-5">Haiku 5.5 (cheapest, fastest)</option>
+        <option value="claude-opus-5-5">Opus 5.5 (most accurate)</option>
+      </select>
+    </label>
+    <label class="field">GitHub token <span class="muted">(only for linking PSA)</span>
+      <input id="set-gh" type="password" autocomplete="off" placeholder="github_pat_…">
+    </label>
+    <label class="field">GitHub repository
+      <input id="set-repo" autocomplete="off" placeholder="username/card-scanner">
+    </label>
+    <div class="row end">
+      <button id="set-save" class="btn primary">Save</button>
+    </div>
+    <hr>
+    <div id="set-data" class="small muted"></div>
+    <div class="row">
+      <button id="btn-export" class="btn secondary">Export list (CSV)</button>
+      <button id="btn-clear" class="btn ghost danger">Clear list</button>
+    </div>
+    <p class="small muted">Keys are stored only on this phone. Prices are TCGplayer market prices, refreshed daily via TCGCSV.</p>
+  </dialog>
+
+  <script src="matcher.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
