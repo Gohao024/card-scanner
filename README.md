@@ -5,7 +5,7 @@ An iPhone home-screen app that scans Pokémon and One Piece cards and builds a l
 - **TCGplayer link** (opens with the Near Mint filter)
 - **Market price**: TCGplayer's market price, refreshed daily. Tap a printing (Holofoil, Reverse Holofoil, 1st Edition…) to switch prices.
 - **Set it was released in**, plus the release month
-- **PSA 9 and PSA 10 population**, looked up automatically (steps 5, 8 and 9)
+- **PSA 9 and PSA 10 population**, looked up automatically (steps 5 and 8)
 - A running **total value** and a **CSV export**
 
 Not included yet: lowest listing from well-rated sellers, and the last NM sale. To see those, use the TCGplayer button on any card.
@@ -78,17 +78,10 @@ The app asks your GitHub job to look up PSA counts for each card you scan. To do
 5. Generate it and copy it.
 6. In the app's Settings, paste it into **GitHub token**. The repository is filled in for you. Tap **Save**.
 
-### 9. Add free eBay developer keys (finds PSA cert numbers)
-PSA's API can't search by card name. So for each card, the GitHub job finds a PSA-graded copy listed on eBay, reads its cert number, and confirms with PSA that it's the same card. That gives PSA's ID for the card, which unlocks the counts. This uses eBay's official API, which is free.
-1. Go to **developer.ebay.com** and click **Register**. Approval can take up to a day.
-2. Open **Application Keysets** and create a **Production** keyset.
-3. eBay will ask about **Marketplace Account Deletion notifications**. Choose the option to **apply for an exemption**: this app doesn't store eBay user data.
-4. Copy the **App ID (Client ID)** and the **Cert ID (Client Secret)**.
-5. In your GitHub repository, go to **Settings → Secrets and variables → Actions** and add two secrets:
-   - `EBAY_CLIENT_ID`: the App ID
-   - `EBAY_CLIENT_SECRET`: the Cert ID
-
-Make sure the `PSA_TOKEN` secret from step 5 is also set.
+That's the whole setup. After this there's nothing to do day-to-day:
+- **Prices** refresh by themselves every day.
+- **PSA counts** are found by themselves for every card you scan.
+- **GitHub pauses scheduled jobs in repositories with no activity for 60 days.** The job prevents this by making a tiny commit when needed, so updates never stop.
 
 ---
 
@@ -98,10 +91,12 @@ Make sure the `PSA_TOKEN` secret from step 5 is also set.
 - **Photos** lets you pick several photos at once. A single photo can also hold several cards.
 - A **yellow border** means the app isn't sure which version you have. This happens often with One Piece parallels, manga art, and alt arts. Tap **Change** and pick the right one.
 - **Search** adds a card by name, number, or set without a photo.
-- **PSA counts are automatic.** After you scan, the card shows "Looking up PSA 9/10 pop…", and counts appear about 3–5 minutes later. They refresh weekly after that.
+- **PSA counts are automatic.** After you scan, the app uses your Claude AI key to search the web for cert numbers of PSA-graded copies of that card, from eBay listings, PSA's cert pages and card shops. Your GitHub job then checks each cert with PSA and only uses one that matches your exact card: name, number, English or Japanese, year, and reverse holo, 1st edition or parallel. Counts appear about 3–5 minutes after a scan and refresh weekly after that.
+  - This costs about 1–3 cents per new card, once, for the Claude AI web search.
+  - If you see a message about web search being disabled, turn it on at console.anthropic.com.
   - Reverse holo and 1st edition have their own PSA counts. Tapping a different printing looks those up too.
   - Tap **details** to see which PSA card it matched. If it's wrong, enter the correct cert number there to override it.
-  - If no graded copy with a cert number is listed on eBay right now, the card says so and tries again about every 10 days. You can also enter a cert number yourself.
+  - If no graded copy can be found online, the card says so and the app searches again about every 10 days. You can also enter a cert number yourself.
   - The free PSA plan allows about 100 lookups a day. A new card uses 2–4 and a weekly refresh uses 1, so you can add roughly 25–40 new cards a day. Anything over the limit is finished the next day.
 - **Gear → Export list (CSV)** shares your list as a spreadsheet file.
 
@@ -109,7 +104,6 @@ Make sure the `PSA_TOKEN` secret from step 5 is also set.
 
 - **Prices are up to a day old.** They come from TCGCSV, a free daily copy of TCGplayer's prices.
 - **The market price isn't condition-specific.** It's TCGplayer's overall market price per printing, not a Near Mint-only number. For most cards it's close to Near Mint.
-- **GitHub pauses daily runs after 60 days of no activity in the repository.** Linking a PSA card counts as activity. If prices stop updating, open the **Actions** tab and click **Enable workflow**.
 - **Card reading uses Sonnet by default.** If it misreads cards often, switch the model to Opus in Settings. To save money, try Haiku.
 
 ## What's in here
@@ -118,8 +112,11 @@ Make sure the `PSA_TOKEN` secret from step 5 is also set.
 |---|---|
 | `app/` | The iPhone app (HTML/CSS/JS, works offline once installed) |
 | `scripts/build_prices.py` | Daily download of card and price data from TCGCSV |
-| `scripts/build_psa.py` | Finds each card's PSA ID via eBay cert numbers, then gets PSA 9/10 population |
+| `scripts/build_psa.py` | Checks the cert numbers the app found with PSA, then gets PSA 9/10 population |
 | `psa-requests.json` | Cards the app wants PSA counts for (the app edits this) |
 | `psa-links.json` | Manual cert overrides (the app edits this) |
 | `.github/workflows/update.yml` | Runs the two scripts daily and publishes the app |
 | `tests/` | Automated tests (`node tests/test_matcher.js`, `python3 tests/test_build.py`, `python3 tests/test_psa.py`) |
+
+## Optional: eBay as an extra source
+Not needed. If some cards never get PSA counts, you can add free eBay developer keys as GitHub secrets named `EBAY_CLIENT_ID` and `EBAY_CLIENT_SECRET` (from a Production keyset at developer.ebay.com). The job will then also search eBay's official API for graded copies.

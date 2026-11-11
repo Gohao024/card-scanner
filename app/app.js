@@ -125,9 +125,11 @@
     if (p && p.g10 != null) {
       return row(`<span>9: <b>${num(p.g9)}</b></span><span>10: <b>${num(p.g10)}</b></span><button class="linkish" data-act="psa">details</button>`);
     }
-    if (p && p.status === 'notfound') return row(`<span class="muted">No PSA copy found online yet. It will keep trying.</span><button class="linkish" data-act="psa">Enter cert</button>`);
+    if (searching.has(key)) return row(`<span class="muted">Searching online for a PSA copy…</span>`);
+    const fresh = searched[key] && (!p || !p.checked || searched[key] > Date.parse(p.checked));
+    if (p && p.status === 'notfound' && fresh) return row(`<span class="muted">Looking up PSA 9/10 pop… (a few minutes)</span>`);
+    if (p && p.status === 'notfound') return row(`<span class="muted">No PSA-graded copy found online yet. Tries again in about 10 days.</span><button class="linkish" data-act="psa">Enter cert</button>`);
     if (p && p.status === 'error') return row(`<span class="muted">Lookup problem: ${esc(p.error || 'unknown')}</span><button class="linkish" data-act="psa">Fix</button>`);
-    if (p && p.status === 'waiting') return row(`<span class="muted">Waiting for eBay keys (see setup guide, step 9).</span>`);
     if (!settings.ghToken) return row(`<span class="muted">Add a GitHub token in Settings to get PSA counts automatically.</span>`);
     if (requested.has(key) || p) return row(`<span class="muted">Looking up PSA 9/10 pop… (a few minutes)</span>`);
     return row(`<span class="muted">Queued for PSA lookup…</span>`);
@@ -150,23 +152,106 @@
     clearTimeout(requestTimer);
     requestTimer = setTimeout(sendPsaRequests, 1500);
   }
+  // When each card was last web-searched for PSA certs (so "not found" cards retry every ~10 days).
+  const searched = store.get('cs.searched', {});
+  const RETRY_MS = 10 * 24 * 3600 * 1000;
+  const searching = new Set();
+  let sending = false;
+
+  /* Ask the Claude AI API to search the web for cert numbers of PSA-graded copies of this card.
+     The GitHub job checks every number with PSA before using it, so wrong guesses are harmless. */
+  async function findCerts(it) {
+    const c = cardOf(it);
+    if (!c || !settings.key) return [];
+    const key = psaKey(it);
+    const lang = it.game === 'pokemon-jp' ? 'Japanese' : 'English';
+    const printing = key.endsWith('-rev') ? 'Reverse Holo' : key.endsWith('-1st') ? '1st Edition'
+      : 'regular (not reverse holo, not 1st edition)';
+    const year = (c.set.date || '').slice(0, 4);
+    const short = M.baseName(c.name);
+    const prompt = `Find PSA certification numbers for PSA-graded copies of this exact trading card:
+- Card: ${c.name} (${c.rarity})
+- Card number: ${c.num}
+- Set: ${c.set.name}${year ? ` (${year})` : ''}
+- Language: ${lang}
+- Printing: ${printing}
+
+Search the web, for example: PSA ${short} ${c.num.split('/')[0]} ${c.set.name.replace(/^[A-Z0-9]+:\s*/, '')} certification number
+Good sources: eBay listings (their item specifics show "Certification Number"), psacard.com/cert pages, and card shop listings of PSA slabs.
+Only include numbers you actually saw on a page for this same card, language and printing. Never guess or make up numbers.
+Reply with ONLY this JSON: {"certs":["12345678"]} with up to 6 numbers, best matches first, or {"certs":[]} if you found none.`;
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': settings.key,
+        'anthropic-version': '2023-06-01',
+        'anthropic-dangerous-direct-browser-access': 'true',
+      },
+      body: JSON.stringify({
+        model: 'claude-haiku-5-5',
+        max_tokens: 1024,
+        tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 3 }],
+        messages: [{ role: 'user', content: prompt }],
+      }),
+    });
+    if (!r.ok) {
+      let msg = `HTTP ${r.status}`;
+      try { msg = (await r.json()).error.message || msg; } catch { /* keep */ }
+      throw new Error(msg);
+    }
+    const j = await r.json();
+    const text = (j.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('\n');
+    const objs = text.match(/\{[^{}]*"certs"[^{}]*\}/g);
+    if (!objs) return [];
+    try {
+      const certs = JSON.parse(objs[objs.length - 1]).certs || [];
+      return [...new Set(certs.map((x) => String(x).replace(/\D/g, '')).filter((x) => x.length >= 7 && x.length <= 10))].slice(0, 6);
+    } catch { return []; }
+  }
+
   async function sendPsaRequests() {
-    const want = {};
+    if (sending) { queuePsa(); return; }
+    // Cards that are new, or were "not found" and haven't been searched in ~10 days.
+    const todo = [];
+    const seen = new Set();
     for (const it of list) {
       if (!it.pid) continue;
       const key = psaKey(it);
-      if (!requested.has(key) && !psa[key]) want[key] = { pid: it.pid, game: it.game };
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const p = psa[key];
+      const isNew = !requested.has(key) && !p;
+      const retry = p && p.status === 'notfound' && Date.now() - (searched[key] || 0) > RETRY_MS;
+      if (isNew || retry) todo.push(it);
     }
-    if (!Object.keys(want).length) return;
+    if (!todo.length) return;
+    sending = true;
+    const want = {};
+    let searchError = '';
     try {
+      for (const it of todo) {
+        const key = psaKey(it);
+        searching.add(key); render();
+        let certs = [];
+        try { certs = await findCerts(it); } catch (e) { searchError = e.message; }
+        searching.delete(key);
+        searched[key] = Date.now();
+        want[key] = { pid: it.pid, game: it.game, certs };
+      }
+      store.set('cs.searched', searched);
       await updateRepoFile('psa-requests.json', (data) => Object.assign(data, want), 'Look up PSA population');
       Object.keys(want).forEach((k) => requested.add(k));
       store.set('cs.requested', [...requested]);
       lastRequestAt = Date.now();
-      render();
       startPolling();
+      if (searchError) showError('PSA web search problem: ' + searchError + ' (If it mentions web search, turn it on at console.anthropic.com.)');
     } catch (e) {
       showError('Could not request PSA counts: ' + e.message);
+    } finally {
+      sending = false;
+      searching.clear();
+      render();
     }
   }
 

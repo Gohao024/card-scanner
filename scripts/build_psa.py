@@ -3,25 +3,29 @@
 
 PSA's free API can't search by card name; it needs PSA's own ID for the card
 (the "spec ID"). Every graded slab's cert number leads to that spec ID, so for
-each card the app asks about, this script:
+each card the app asks about:
 
-  1. searches eBay (official Browse API) for PSA-graded copies of the card,
-  2. reads the cert number sellers attach to graded-card listings,
-  3. checks that cert with PSA to make sure it's really the same card
+  1. the app uses the Claude AI API's web search to find cert numbers of
+     PSA-graded copies of the card (eBay listings, PSA cert pages, shops) and
+     sends them here in psa-requests.json,
+  2. this script checks each cert with PSA to make sure it's really the same card
      (name, number, English/Japanese, year, reverse holo / 1st edition / parallel),
-  4. looks up the PSA 9 and PSA 10 population for that spec.
+  3. then looks up the PSA 9 and PSA 10 population for that spec.
+
+If eBay developer keys are set (optional), eBay is also searched when the app's
+candidates don't pan out.
 
 Cards are found automatically; psa-links.json can still pin a specific cert by
 hand if the automatic match is ever wrong.
 
 Inputs (repo root):
-  psa-requests.json  {"<key>": {"pid": 123, "game": "pokemon"}} written by the app
+  psa-requests.json  {"<key>": {"pid": 123, "game": "pokemon", "certs": ["12345678", ...]}} written by the app
   psa-links.json     {"<key>": "<cert number>"} optional manual overrides
   (<key> is the TCGplayer product id, plus "-rev" or "-1st" for those printings)
 
 Env:
   PSA_TOKEN                          PSA API token (GitHub secret)
-  EBAY_CLIENT_ID / EBAY_CLIENT_SECRET eBay developer keys (GitHub secrets)
+  EBAY_CLIENT_ID / EBAY_CLIENT_SECRET optional eBay developer keys (GitHub secrets)
   SITE_URL                           your GitHub Pages address (re-uses the last psa.json)
   PSA_DAILY_LIMIT                    PSA calls allowed per day (default 95; free plan is 100)
 
@@ -119,6 +123,15 @@ def number_key(num):
     return re.sub(r"\D", "", left).lstrip("0")
 
 
+def number_matches(psa_num, card_num):
+    """PSA writes 'OP05-119' as '119' and '025/165' as '025' or '199'; accept either form."""
+    p = number_key(psa_num)
+    left = str(card_num or "").split("/")[0]
+    runs = re.findall(r"\d+", left)
+    forms = {number_key(left), (runs[-1].lstrip("0") if runs else "")}
+    return bool(p) and p in forms
+
+
 # ---------------------------------------------------------------- data
 def load_cards(data_dir, games):
     cards = {}
@@ -205,7 +218,7 @@ def describe(c):
 
 def matches_card(c, card, printing):
     """Does a PSA cert describe this exact TCGplayer card? Returns (ok, reason)."""
-    if number_key(c["number"]) != number_key(card["num"]):
+    if not number_matches(c["number"], card["num"]):
         return False, f"number {c['number']} ≠ {card['num']}"
     subj = re.sub(r"^(FA|SR|AR|SAR|CHR|TG|GG|RC)\s*/\s*", "", c["subject"], flags=re.I)
     if similarity(subj, base_name(card["name"])) < 0.5:
@@ -316,10 +329,29 @@ def title_plausible(title, card):
     t = title.upper()
     if "PSA" not in t:
         return False
-    key = number_key(card["num"])
-    nums = {number_key(n) for n in re.findall(r"[A-Z]*\d+(?:-\d+)?", t)}
+    nums = re.findall(r"[A-Z]*\d+(?:-\d+)?", t)
     words = [w for w in norm(base_name(card["name"])).split() if len(w) > 2]
-    return key in nums and (not words or any(w.upper() in t for w in words))
+    return any(number_matches(n, card["num"]) for n in nums) and (not words or any(w.upper() in t for w in words))
+
+
+def check_certs(psa, certs, card, printing, checked, reasons):
+    """Try candidate certs (from the app's web search). Returns (cert, info) or (None, None)."""
+    for cert in certs:
+        cert = re.sub(r"\D", "", str(cert))
+        if not cert or cert in checked:
+            continue
+        if len(checked) >= MAX_CERT_CHECKS_PER_CARD:
+            break
+        checked.add(cert)
+        info = psa.cert(cert)
+        if not info:
+            reasons.append(f"cert {cert} not found")
+            continue
+        ok, why = matches_card(info, card, printing)
+        if ok:
+            return cert, info
+        reasons.append(f"cert {cert}: {why}")
+    return None, None
 
 
 def find_spec_via_ebay(ebay, psa, card, printing):
@@ -400,7 +432,12 @@ def main():
         psa = PSA(token, max(0, daily_limit - used_today))
         ebay = Ebay(eb_id, eb_secret) if eb_id and eb_secret else None
         if not ebay:
-            log("No eBay keys set; only manually linked cards will be looked up.")
+            log("No eBay keys set; using the cert numbers the app found by web search.")
+
+        def new_candidates(k):
+            certs = [re.sub(r"\D", "", str(c)) for c in ((requests.get(k) or {}).get("certs") or [])]
+            tried = set(cards_out.get(k, {}).get("tried") or [])
+            return [c for c in certs if c and c not in tried]
 
         def priority(k):
             e = cards_out.get(k, {})
@@ -408,7 +445,9 @@ def main():
             if manual or ("g10" not in e and e.get("status") not in ("notfound",)):
                 return 0  # new
             if e.get("status") == "notfound":
-                return 2 if age(e, "checked") > RETRY_NOT_FOUND_AFTER else 9
+                if new_candidates(k):
+                    return 0  # the app found new candidates
+                return 2 if ebay and age(e, "checked") > RETRY_NOT_FOUND_AFTER else 9
             return 1 if age(e) > REFRESH_AFTER else 9
 
         todo = sorted((k for k in wanted if priority(k) < 9), key=priority)
@@ -431,15 +470,21 @@ def main():
                         e.clear()
                         e.update({"cert": links[key], "spec": info["spec"], "certDesc": describe(info), "source": "manual"})
                     elif not e.get("spec"):
-                        if not ebay:
-                            e.update({"status": "waiting", "checked": now().isoformat(timespec="seconds")})
-                            continue
-                        cert, info = find_spec_via_ebay(ebay, psa, card, printing)
+                        checked, reasons = set(), []
+                        cert, info = check_certs(psa, new_candidates(key), card, printing, checked, reasons)
+                        source = "web"
+                        e["tried"] = sorted(set(e.get("tried") or []) | checked)
+                        if not cert and ebay:
+                            cert, info = find_spec_via_ebay(ebay, psa, card, printing)
+                            source = "ebay"
+                            if not cert:
+                                reasons.append(info)
                         if not cert:
-                            e.update({"status": "notfound", "error": info, "checked": now().isoformat(timespec="seconds")})
-                            log(f"  {key} {card['name']}: not found ({info})")
+                            why = "; ".join(r for r in reasons[-3:] if r) or "no PSA-graded copy found online yet"
+                            e.update({"status": "notfound", "error": why, "checked": now().isoformat(timespec="seconds")})
+                            log(f"  {key} {card['name']}: not found ({why})")
                             continue
-                        e.update({"cert": cert, "spec": info["spec"], "certDesc": describe(info), "source": "ebay"})
+                        e.update({"cert": cert, "spec": info["spec"], "certDesc": describe(info), "source": source})
                     # 2. Population
                     pop = psa.population(e["spec"])
                     e.update({k: v for k, v in pop.items() if v is not None})
