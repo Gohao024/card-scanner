@@ -5,12 +5,13 @@ PSA's free API can't search by card name; it needs PSA's own ID for the card
 (the "spec ID"). Every graded slab's cert number leads to that spec ID, so for
 each card the app asks about:
 
-  1. the app uses the Claude AI API's web search to find cert numbers of
-     PSA-graded copies of the card (eBay listings, PSA cert pages, shops) and
-     sends them here in psa-requests.json,
-  2. this script checks each cert with PSA to make sure it's really the same card
-     (name, number, English/Japanese, year, reverse holo / 1st edition / parallel),
-  3. then looks up the PSA 9 and PSA 10 population for that spec.
+  1. the app uses the Claude AI API's web search, limited to PSA's own websites,
+     to find the card's PSA page; it sends the ID at the end of that page's link
+     (PSA's card ID) plus cert numbers from the page's sales list, in psa-requests.json,
+  2. this script asks PSA's official API about each ID and checks the result is
+     really the same card (number, name, English/Japanese, year, reverse holo /
+     1st edition / parallel); that one call also returns the PSA 9 / PSA 10 counts,
+  3. if no ID checks out, it tries the cert numbers the same way.
 
 If eBay developer keys are set (optional), eBay is also searched when the app's
 candidates don't pan out.
@@ -155,7 +156,7 @@ def read_json(path, default):
     try:
         with open(path, encoding="utf-8") as f:
             return json.load(f) or default
-    except (FileNotFoundError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError):
         return default
 
 
@@ -204,7 +205,8 @@ class PSA:
     def population(self, spec):
         data = self.call(f"/pop/GetPSASpecPopulation/{spec}")
         pop = pick(data, "PSAPop") or {}
-        return {"g9": pick(pop, "Grade9"), "g10": pick(pop, "Grade10"), "total": pick(pop, "Total")}
+        return {"g9": pick(pop, "Grade9"), "g10": pick(pop, "Grade10"), "total": pick(pop, "Total"),
+                "desc": str(pick(data, "Description") or "")}
 
 
 def describe(c):
@@ -243,6 +245,60 @@ def matches_card(c, card, printing):
     if card["game"] == "onepiece" and card_alt != psa_alt:
         return False, "parallel/alt art differs"
     return True, ""
+
+
+def matches_text(text, card, printing, number_hint=""):
+    """Does a PSA page title / spec description describe this exact card? Returns (ok, reason)."""
+    t = str(text or "").upper()
+    m = re.search(r"#\s*([A-Z0-9][A-Z0-9-]*)", t)
+    num = m.group(1) if m else str(number_hint or "")
+    if not num:
+        return False, "PSA page doesn't show a card number to compare"
+    if not number_matches(num, card["num"]):
+        return False, f"number {num} ≠ {card['num']}"
+    words = [w for w in norm(base_name(card["name"])).split() if len(w) > 1]
+    padded = f" {norm(t)} "
+    if not words or not all(f" {w} " in padded for w in words):
+        return False, f"name doesn't match {card['name']}"
+    if ("JAPANESE" in t) != (card["game"] == "pokemon-jp"):
+        return False, "language differs"
+    y = re.search(r"\b(19|20)\d{2}\b", t)
+    if y and card.get("date") and abs(int(y.group(0)) - int(card["date"][:4])) > 1:
+        return False, f"year {y.group(0)} vs {card['date'][:4]}"
+    if (printing == "rev") != ("REVERSE" in t):
+        return False, "reverse holo differs"
+    if (printing == "1st") != ("1ST ED" in t):
+        return False, "1st edition differs"
+    if card["game"] == "onepiece":
+        card_alt = bool(VARIANT_RE.search(variant_text(card["name"])))
+        psa_alt = bool(re.search(r"ALT|PARALLEL|MANGA|SPECIAL|\bSP\b|TREASURE|SERIAL", t))
+        if card_alt != psa_alt:
+            return False, "parallel/alt art differs"
+    return True, ""
+
+
+def check_specs(psa, specs, card, printing, tried, reasons):
+    """Try PSA card IDs taken from PSA's own web pages. One PSA call each, and it returns the counts too.
+    Returns (spec, description, population) or None."""
+    for sp in specs[:3]:
+        sid = re.sub(r"\D", "", str(sp.get("id", "")))
+        if not sid or sid in tried:
+            continue
+        tried.add(sid)
+        try:
+            pop = psa.population(sid)
+        except urllib.error.HTTPError as e:
+            reasons.append(f"PSA page {sid}: PSA said {e.code}")
+            continue
+        if pop.get("g10") is None and pop.get("total") is None:
+            reasons.append(f"PSA page {sid}: not a PSA card ID")
+            continue
+        text = f"{pop.get('desc', '')} | {sp.get('title', '')}"
+        ok, why = matches_text(text, card, printing, sp.get("number", ""))
+        if ok:
+            return int(sid), (pop.get("desc") or sp.get("title") or "").strip(), pop
+        reasons.append(f"PSA page {sid}: {why}")
+    return None
 
 
 # ---------------------------------------------------------------- eBay
@@ -400,6 +456,8 @@ def age(entry, field="updated"):
 def main():
     data_dir = sys.argv[1] if len(sys.argv) > 1 else "site/data"
     repo = sys.argv[2] if len(sys.argv) > 2 else "."
+    if os.path.isfile(repo):  # older workflow passed psa-links.json here
+        repo = os.path.dirname(repo) or "."
     os.makedirs(data_dir, exist_ok=True)
     site_url = (os.environ.get("SITE_URL") or "").rstrip("/")
     token = (os.environ.get("PSA_TOKEN") or "").strip()
@@ -439,13 +497,18 @@ def main():
             tried = set(cards_out.get(k, {}).get("tried") or [])
             return [c for c in certs if c and c not in tried]
 
+        def new_specs(k):
+            tried = set(cards_out.get(k, {}).get("triedSpecs") or [])
+            return [sp for sp in ((requests.get(k) or {}).get("specs") or [])
+                    if isinstance(sp, dict) and re.sub(r"\D", "", str(sp.get("id", ""))) not in tried]
+
         def priority(k):
             e = cards_out.get(k, {})
             manual = k in links and e.get("cert") != links[k]
             if manual or ("g10" not in e and e.get("status") not in ("notfound",)):
                 return 0  # new
             if e.get("status") == "notfound":
-                if new_candidates(k):
+                if new_candidates(k) or new_specs(k):
                     return 0  # the app found new candidates
                 return 2 if ebay and age(e, "checked") > RETRY_NOT_FOUND_AFTER else 9
             return 1 if age(e) > REFRESH_AFTER else 9
@@ -471,8 +534,22 @@ def main():
                         e.update({"cert": links[key], "spec": info["spec"], "certDesc": describe(info), "source": "manual"})
                     elif not e.get("spec"):
                         checked, reasons = set(), []
+                        # a) PSA's own pages: the ID in the page link (one call, includes the counts)
+                        spec_tried = set(e.get("triedSpecs") or [])
+                        hit = check_specs(psa, new_specs(key), card, printing, spec_tried, reasons)
+                        e["triedSpecs"] = sorted(spec_tried)
+                        if hit:
+                            spec, desc, pop = hit
+                            e.update({"spec": spec, "certDesc": desc, "source": "psa-site"})
+                            e.update({k: v for k, v in pop.items() if v is not None and k != "desc"})
+                            e.update({"status": "ok", "updated": now().isoformat(timespec="seconds"),
+                                      "checked": now().isoformat(timespec="seconds")})
+                            e.pop("error", None)
+                            log(f"  {key} {card['name']}: PSA 9={e.get('g9')} PSA 10={e.get('g10')} ({desc})")
+                            continue
+                        # b) cert numbers from the sales list on those PSA pages
                         cert, info = check_certs(psa, new_candidates(key), card, printing, checked, reasons)
-                        source = "web"
+                        source = "psa-site"
                         e["tried"] = sorted(set(e.get("tried") or []) | checked)
                         if not cert and ebay:
                             cert, info = find_spec_via_ebay(ebay, psa, card, printing)
@@ -480,14 +557,14 @@ def main():
                             if not cert:
                                 reasons.append(info)
                         if not cert:
-                            why = "; ".join(r for r in reasons[-3:] if r) or "no PSA-graded copy found online yet"
+                            why = "; ".join(r for r in reasons[-3:] if r) or "not found on PSA's website yet"
                             e.update({"status": "notfound", "error": why, "checked": now().isoformat(timespec="seconds")})
                             log(f"  {key} {card['name']}: not found ({why})")
                             continue
                         e.update({"cert": cert, "spec": info["spec"], "certDesc": describe(info), "source": source})
                     # 2. Population
                     pop = psa.population(e["spec"])
-                    e.update({k: v for k, v in pop.items() if v is not None})
+                    e.update({k: v for k, v in pop.items() if v is not None and k != "desc"})
                     e.update({"status": "ok", "updated": now().isoformat(timespec="seconds"),
                               "checked": now().isoformat(timespec="seconds")})
                     e.pop("error", None)

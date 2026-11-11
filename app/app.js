@@ -125,10 +125,10 @@
     if (p && p.g10 != null) {
       return row(`<span>9: <b>${num(p.g9)}</b></span><span>10: <b>${num(p.g10)}</b></span><button class="linkish" data-act="psa">details</button>`);
     }
-    if (searching.has(key)) return row(`<span class="muted">Searching online for a PSA copy…</span>`);
+    if (searching.has(key)) return row(`<span class="muted">Finding this card on PSA’s website…</span>`);
     const fresh = searched[key] && (!p || !p.checked || searched[key] > Date.parse(p.checked));
     if (p && p.status === 'notfound' && fresh) return row(`<span class="muted">Looking up PSA 9/10 pop… (a few minutes)</span>`);
-    if (p && p.status === 'notfound') return row(`<span class="muted">No PSA-graded copy found online yet. Tries again in about 10 days.</span><button class="linkish" data-act="psa">Enter cert</button>`);
+    if (p && p.status === 'notfound') return row(`<span class="muted">Not found on PSA’s website yet. Tries again in about 10 days.</span><button class="linkish" data-act="psa">Enter cert</button>`);
     if (p && p.status === 'error') return row(`<span class="muted">Lookup problem: ${esc(p.error || 'unknown')}</span><button class="linkish" data-act="psa">Fix</button>`);
     if (!settings.ghToken) return row(`<span class="muted">Add a GitHub token in Settings to get PSA counts automatically.</span>`);
     if (requested.has(key) || p) return row(`<span class="muted">Looking up PSA 9/10 pop… (a few minutes)</span>`);
@@ -152,35 +152,62 @@
     clearTimeout(requestTimer);
     requestTimer = setTimeout(sendPsaRequests, 1500);
   }
-  // When each card was last web-searched for PSA certs (so "not found" cards retry every ~10 days).
-  const searched = store.get('cs.searched', {});
+  // When each card was last searched for on PSA's site (so "not found" cards retry every ~10 days).
+  const searched = store.get('cs.searched2', {});
   const RETRY_MS = 10 * 24 * 3600 * 1000;
   const searching = new Set();
-  const found = store.get('cs.found', {});   // searches done but not yet delivered to GitHub
+  const found = store.get('cs.found2', {});   // searches done but not yet delivered to GitHub
   let sending = false;
 
-  /* Ask the Claude AI API to search the web for cert numbers of PSA-graded copies of this card.
-     The GitHub job checks every number with PSA before using it, so wrong guesses are harmless. */
-  async function findCerts(it) {
+  /* Find this card's page on PSA's own website (psacard.com / psacard.co.jp) using the Claude AI API's
+     web search, limited to PSA's sites. From each matching PSA page we keep:
+       - the number at the end of its link (PSA's ID for the card), and
+       - cert numbers from that page's recent-sales list.
+     The GitHub job confirms these with PSA's official API before using them, so a wrong page is harmless. */
+  function extractJson(text, field) {
+    const at = text.lastIndexOf(`"${field}"`);
+    if (at < 0) return null;
+    for (let start = text.lastIndexOf('{', at); start >= 0; start = text.lastIndexOf('{', start - 1)) {
+      let depth = 0, inStr = false, esc = false;
+      for (let i = start; i < text.length; i++) {
+        const ch = text[i];
+        if (inStr) { if (esc) esc = false; else if (ch === '\\') esc = true; else if (ch === '"') inStr = false; continue; }
+        if (ch === '"') inStr = true;
+        else if (ch === '{') depth++;
+        else if (ch === '}' && --depth === 0) {
+          try { const o = JSON.parse(text.slice(start, i + 1)); if (o && o[field]) return o; } catch { /* try an outer brace */ }
+          break;
+        }
+      }
+    }
+    return null;
+  }
+
+  async function findOnPsa(it) {
     const c = cardOf(it);
-    if (!c || !settings.key) return [];
+    if (!c || !settings.key) return { certs: [], specs: [] };
     const key = psaKey(it);
-    const lang = it.game === 'pokemon-jp' ? 'Japanese' : 'English';
+    const jp = it.game === 'pokemon-jp';
     const printing = key.endsWith('-rev') ? 'Reverse Holo' : key.endsWith('-1st') ? '1st Edition'
       : 'regular (not reverse holo, not 1st edition)';
     const year = (c.set.date || '').slice(0, 4);
     const short = M.baseName(c.name);
-    const prompt = `Find PSA certification numbers for PSA-graded copies of this exact trading card:
+    const variant = (c.name.match(/\(([^)]*)\)/) || [])[1] || '';
+    const setShort = c.set.name.replace(/^[A-Z0-9]+:\s*/, '');
+    const prompt = `Find this exact trading card's page on PSA's website (psacard.com or psacard.co.jp). PSA's "auction prices" pages show a card's population by grade and recent sales.
 - Card: ${c.name} (${c.rarity})
 - Card number: ${c.num}
 - Set: ${c.set.name}${year ? ` (${year})` : ''}
-- Language: ${lang}
-- Printing: ${printing}
+- Language: ${jp ? 'Japanese (PSA puts JAPANESE in the set name)' : 'English (PSA set name does NOT say JAPANESE)'}
+- Printing: ${printing}${variant ? `\n- Variant: ${variant} (PSA usually writes this after a | in the title, e.g. "| ALTERNATE ART")` : ''}
 
-Search the web, for example: PSA ${short} ${c.num.split('/')[0]} ${c.set.name.replace(/^[A-Z0-9]+:\s*/, '')} certification number
-Good sources: eBay listings (their item specifics show "Certification Number"), psacard.com/cert pages, and card shop listings of PSA slabs.
-Only include numbers you actually saw on a page for this same card, language and printing. Never guess or make up numbers.
-Reply with ONLY this JSON: {"certs":["12345678"]} with up to 6 numbers, best matches first, or {"certs":[]} if you found none.`;
+Search, for example: psacard auction prices ${year} ${setShort} ${short} ${c.num.split('/')[0]}
+Only use PSA pages for this same card: same card, same number, same language and same printing/variant.
+For each matching page give its exact URL, its title, the card number it shows (if any), and up to 5 cert numbers from its sales list.
+Never guess or make anything up.
+Reply with ONLY this JSON:
+{"pages":[{"url":"https://www.psacard.com/auctionprices/...","title":"...","card_number":"...","certs":["12345678"]}]}
+or {"pages":[]} if you found no matching PSA page.`;
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
@@ -191,8 +218,8 @@ Reply with ONLY this JSON: {"certs":["12345678"]} with up to 6 numbers, best mat
       },
       body: JSON.stringify({
         model: 'claude-haiku-5-5',
-        max_tokens: 1024,
-        tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 3 }],
+        max_tokens: 1500,
+        tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 3, allowed_domains: ['psacard.com', 'psacard.co.jp'] }],
         messages: [{ role: 'user', content: prompt }],
       }),
     });
@@ -203,12 +230,21 @@ Reply with ONLY this JSON: {"certs":["12345678"]} with up to 6 numbers, best mat
     }
     const j = await r.json();
     const text = (j.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('\n');
-    const objs = text.match(/\{[^{}]*"certs"[^{}]*\}/g);
-    if (!objs) return [];
-    try {
-      const certs = JSON.parse(objs[objs.length - 1]).certs || [];
-      return [...new Set(certs.map((x) => String(x).replace(/\D/g, '')).filter((x) => x.length >= 7 && x.length <= 10))].slice(0, 6);
-    } catch { return []; }
+    const o = extractJson(text, 'pages');
+    const certs = [], specs = [];
+    for (const pg of (o && Array.isArray(o.pages) ? o.pages : [])) {
+      const url = String(pg.url || '');
+      if (!/^https:\/\/(www\.)?psacard\.(com|co\.jp)\//i.test(url)) continue;
+      const m = url.split(/[?#]/)[0].match(/\/(\d{4,10})\/?$/);
+      if (m && !specs.some((x) => x.id === m[1])) {
+        specs.push({ id: m[1], title: String(pg.title || '').slice(0, 200), number: String(pg.card_number || '').slice(0, 20), url: url.slice(0, 300) });
+      }
+      for (const x of (Array.isArray(pg.certs) ? pg.certs : [])) {
+        const d = String(x).replace(/\D/g, '');
+        if (d.length >= 7 && d.length <= 10 && !certs.includes(d)) certs.push(d);
+      }
+    }
+    return { certs: certs.slice(0, 6), specs: specs.slice(0, 3) };
   }
 
   async function sendPsaRequests() {
@@ -233,19 +269,20 @@ Reply with ONLY this JSON: {"certs":["12345678"]} with up to 6 numbers, best mat
     try {
       for (const it of todo) {
         const key = psaKey(it);
-        let certs = found[key];
+        let res = found[key];
+        if (Array.isArray(res)) res = { certs: res, specs: [] };   // saved by an older version
         // Re-use a recent search if sending it to GitHub failed last time (saves search costs).
-        if (!certs || Date.now() - (searched[key] || 0) > RETRY_MS) {
+        if (!res || Date.now() - (searched[key] || 0) > RETRY_MS) {
           searching.add(key); render();
-          try { certs = await findCerts(it); searched[key] = Date.now(); found[key] = certs; } catch (e) { searchError = e.message; certs = []; }
+          try { res = await findOnPsa(it); searched[key] = Date.now(); found[key] = res; } catch (e) { searchError = e.message; res = { certs: [], specs: [] }; }
           searching.delete(key);
-          store.set('cs.searched', searched); store.set('cs.found', found);
+          store.set('cs.searched2', searched); store.set('cs.found2', found);
         }
-        want[key] = { pid: it.pid, game: it.game, certs };
+        want[key] = { pid: it.pid, game: it.game, certs: res.certs, specs: res.specs };
       }
       await updateRepoFile('psa-requests.json', (data) => Object.assign(data, want), 'Look up PSA population');
       Object.keys(want).forEach((k) => delete found[k]);
-      store.set('cs.found', found);
+      store.set('cs.found2', found);
       Object.keys(want).forEach((k) => requested.add(k));
       store.set('cs.requested', [...requested]);
       lastRequestAt = Date.now();
@@ -270,7 +307,7 @@ Reply with ONLY this JSON: {"certs":["12345678"]} with up to 6 numbers, best mat
       if (document.visibilityState !== 'visible') return;
       await loadPsa();
       render();
-    }, 60 * 1000);
+    }, 20 * 1000);
   }
 
   $('#list').addEventListener('click', (e) => {
@@ -509,10 +546,10 @@ If no card is visible, reply {"cards":[]}.`;
     $('#psa-cert').value = linked && linked.cert ? linked.cert : '';
     $('#psa-unlink').hidden = !(linked && linked.source === 'manual');
     $('#psa-msg').textContent = linked && linked.certDesc
-      ? `Matched to PSA: ${linked.certDesc}${linked.source === 'ebay' ? ' (found automatically). If that’s the wrong card, enter the right cert below.' : ''}`
+      ? `Matched to PSA: ${linked.certDesc}${linked.source !== 'manual' ? ' (found automatically). If that’s the wrong card, enter the right cert below.' : ''}`
       : 'Normally found automatically. Only enter a cert if it can’t find one or picked the wrong card.';
     const q = c ? `PSA ${M.baseName(c.name)} ${c.num.split('/')[0]} ${c.set.name}` : 'PSA';
-    $('#psa-find').href = `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(q)}`;
+    $('#psa-find').href = `https://www.psacard.com/auctionprices/search?q=${encodeURIComponent(q.replace(/^PSA\s+/, ''))}`;
     dlgPsa.showModal();
   }
 
