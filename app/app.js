@@ -156,6 +156,7 @@
   const searched = store.get('cs.searched', {});
   const RETRY_MS = 10 * 24 * 3600 * 1000;
   const searching = new Set();
+  const found = store.get('cs.found', {});   // searches done but not yet delivered to GitHub
   let sending = false;
 
   /* Ask the Claude AI API to search the web for cert numbers of PSA-graded copies of this card.
@@ -232,15 +233,19 @@ Reply with ONLY this JSON: {"certs":["12345678"]} with up to 6 numbers, best mat
     try {
       for (const it of todo) {
         const key = psaKey(it);
-        searching.add(key); render();
-        let certs = [];
-        try { certs = await findCerts(it); } catch (e) { searchError = e.message; }
-        searching.delete(key);
-        searched[key] = Date.now();
+        let certs = found[key];
+        // Re-use a recent search if sending it to GitHub failed last time (saves search costs).
+        if (!certs || Date.now() - (searched[key] || 0) > RETRY_MS) {
+          searching.add(key); render();
+          try { certs = await findCerts(it); searched[key] = Date.now(); found[key] = certs; } catch (e) { searchError = e.message; certs = []; }
+          searching.delete(key);
+          store.set('cs.searched', searched); store.set('cs.found', found);
+        }
         want[key] = { pid: it.pid, game: it.game, certs };
       }
-      store.set('cs.searched', searched);
       await updateRepoFile('psa-requests.json', (data) => Object.assign(data, want), 'Look up PSA population');
+      Object.keys(want).forEach((k) => delete found[k]);
+      store.set('cs.found', found);
       Object.keys(want).forEach((k) => requested.add(k));
       store.set('cs.requested', [...requested]);
       lastRequestAt = Date.now();
@@ -481,7 +486,7 @@ If no card is visible, reply {"cards":[]}.`;
     let sha, data = {};
     const r = await fetch(url, { headers, cache: 'no-store' });
     if (r.ok) { const j = await r.json(); sha = j.sha; data = JSON.parse(b64decode(j.content) || '{}'); }
-    else if (r.status === 401) throw new Error('GitHub rejected the token. Check it in Settings.');
+    else if (r.status === 401) throw new Error('GitHub rejected the token. Open Settings and tap “Test GitHub connection” to see why.');
     else if (r.status !== 404) throw new Error(`GitHub said ${r.status}. Check the token and repository name.`);
     mutate(data);
     const put = await fetch(url, {
@@ -535,6 +540,7 @@ If no card is visible, reply {"cards":[]}.`;
   // ---------- settings ----------
   const dlgSet = $('#dlg-settings');
   function openSettings() {
+    $('#set-test-out').textContent = '';
     $('#set-key').value = settings.key;
     $('#set-model').value = settings.model || DEFAULT_MODEL;
     $('#set-gh').value = settings.ghToken;
@@ -544,11 +550,58 @@ If no card is visible, reply {"cards":[]}.`;
     dlgSet.showModal();
   }
   $('#btn-settings').addEventListener('click', openSettings);
+
+  // Keys only ever contain letters, numbers, "_" and "-": drop anything else a paste might carry along
+  // (spaces, line breaks, invisible characters).
+  function cleanKey(v) { return String(v || '').replace(/[^A-Za-z0-9_-]/g, ''); }
+  function cleanRepo(v) {
+    return String(v || '').trim().replace(/^https?:\/\/(www\.)?github\.com\//i, '').replace(/\.git$/, '')
+      .replace(/\/+$/, '').replace(/\s+/g, '');
+  }
+  $('#set-show').addEventListener('click', () => {
+    const on = !$('#set-gh').classList.contains('shown');
+    ['#set-key', '#set-gh'].forEach((id) => $(id).classList.toggle('shown', on));
+    $('#set-show').textContent = on ? 'Hide keys' : 'Show keys';
+  });
+
+  async function testGitHub() {
+    const out = $('#set-test-out');
+    const token = cleanKey($('#set-gh').value);
+    const repo = cleanRepo($('#set-repo').value);
+    const lines = [];
+    const say = (t) => { lines.push(t); out.textContent = lines.join('\n'); };
+    out.textContent = 'Testing…';
+    if (!token) { out.textContent = '✗ The GitHub token field is empty.'; return; }
+    say(`Token starts with “${token.slice(0, 12)}…” and is ${token.length} characters long.`);
+    if (!/^(github_pat_|ghp_)/.test(token)) say('✗ GitHub tokens start with “github_pat_”. This looks like something else was pasted.');
+    else if (token.startsWith('github_pat_') && token.length < 80) say('✗ That’s shorter than a full token (usually about 93 characters). Part of it may be missing.');
+    const headers = { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json' };
+    try {
+      const u = await fetch('https://api.github.com/user', { headers, cache: 'no-store' });
+      if (u.status === 401) {
+        say('✗ GitHub says this token is not valid (“Bad credentials”). It was probably regenerated or deleted after it was copied, or has expired. Create a fresh token, copy it, and paste it here.');
+        return;
+      }
+      if (u.ok) say(`✓ GitHub accepts the token (account: ${(await u.json()).login}).`);
+      if (!repo) { say('✗ The repository field is empty. It should be: yourname/card-scanner'); return; }
+      const r = await fetch(`https://api.github.com/repos/${repo}`, { headers, cache: 'no-store' });
+      if (r.status === 404) { say(`✗ The token can’t see “${repo}”. Check the repository name, and that the token’s Repository access includes it.`); return; }
+      if (!r.ok) { say(`✗ GitHub answered ${r.status} for “${repo}”.`); return; }
+      say(`✓ Repository “${repo}” found.`);
+      const c = await fetch(`https://api.github.com/repos/${repo}/contents/psa-requests.json`, { headers, cache: 'no-store' });
+      if (c.ok || c.status === 404) say('✓ The token can read your files. If saving still fails, give the token “Contents: Read and write” permission.');
+      else say(`✗ Reading files failed (${c.status}). Give the token “Contents: Read and write” permission.`);
+      say('Tap Save to use these settings.');
+    } catch (e) {
+      say('✗ Couldn’t reach GitHub: ' + e.message);
+    }
+  }
+  $('#set-test').addEventListener('click', testGitHub);
   $('#set-save').addEventListener('click', () => {
-    settings.key = $('#set-key').value.trim();
+    settings.key = cleanKey($('#set-key').value);
     settings.model = $('#set-model').value;
-    settings.ghToken = $('#set-gh').value.trim();
-    settings.ghRepo = $('#set-repo').value.trim().replace(/^https?:\/\/github\.com\//, '').replace(/\/$/, '');
+    settings.ghToken = cleanKey($('#set-gh').value);
+    settings.ghRepo = cleanRepo($('#set-repo').value);
     store.set('cs.settings', settings);
     dlgSet.close();
     showError('');

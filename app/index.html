@@ -100,7 +100,7 @@
       <button class="icon-btn" aria-label="Close">✕</button>
     </form>
     <label class="field">Claude AI API key <span class="muted">(reads your cards)</span>
-      <input id="set-key" type="password" autocomplete="off" placeholder="sk-ant-…">
+      <input id="set-key" class="secret" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="sk-ant-…">
     </label>
     <label class="field">Card reading model
       <select id="set-model">
@@ -110,11 +110,16 @@
       </select>
     </label>
     <label class="field">GitHub token <span class="muted">(for automatic PSA counts)</span>
-      <input id="set-gh" type="password" autocomplete="off" placeholder="github_pat_…">
+      <input id="set-gh" class="secret" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="github_pat_…">
     </label>
     <label class="field">GitHub repository
-      <input id="set-repo" autocomplete="off" placeholder="username/card-scanner">
+      <input id="set-repo" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="username/card-scanner">
     </label>
+    <div class="row">
+      <button id="set-show" class="btn ghost small-btn">Show keys</button>
+      <button id="set-test" class="btn secondary small-btn">Test GitHub connection</button>
+    </div>
+    <p id="set-test-out" class="small"></p>
     <div class="row end">
       <button id="set-save" class="btn primary">Save</button>
     </div>

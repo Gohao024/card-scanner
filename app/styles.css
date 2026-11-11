@@ -145,3 +145,8 @@ hr { border: 0; border-top: 1px solid var(--line); margin: 16px 0; }
 .pick .p-name { font-weight: 600; font-size: 15px; }
 .pick .p-sub { font-size: 12px; color: var(--muted); }
 .pick .p-price { font-weight: 700; font-variant-numeric: tabular-nums; }
+
+/* Keys look like dots but aren't "password" fields, so iPhone password AutoFill can't swap them out. */
+.secret { -webkit-text-security: disc; font-family: ui-monospace, Menlo, monospace; }
+.secret.shown { -webkit-text-security: none; }
+#set-test-out { white-space: pre-line; }
