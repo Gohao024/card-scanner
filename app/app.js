@@ -13,7 +13,7 @@
   };
   const settings = Object.assign({ key: '', model: DEFAULT_MODEL, ghToken: '', ghRepo: guessRepo() }, store.get('cs.settings', {}));
   if (!settings.ghRepo) settings.ghRepo = guessRepo();
-  let list = store.get('cs.list', []);   // [{uid, game, pid, printing, added, detected, candidates, psaPending}]
+  let list = store.get('cs.list', []);   // [{uid, game, pid, printing, added, detected, candidates, check}]
   const saveList = () => store.set('cs.list', list);
 
   function guessRepo() {
@@ -46,12 +46,6 @@
   }
   async function loadPsa() {
     try { psa = (await fetchJSON('data/psa.json')).cards || {}; } catch { psa = {}; }
-    // Clear "pending" once real numbers have arrived.
-    let changed = false;
-    for (const it of list) {
-      if (it.psaPending && psa[it.pid] && (psa[it.pid].g10 != null || psa[it.pid].error)) { it.psaPending = false; changed = true; }
-    }
-    if (changed) saveList();
   }
   function loadGame(game) {
     if (games[game]) return Promise.resolve(games[game]);
@@ -125,14 +119,68 @@
   }
 
   function psaHtml(it) {
-    const p = psa[it.pid];
+    const key = psaKey(it);
+    const p = psa[key];
+    const row = (inner) => `<div class="psa"><span class="tag">PSA</span>${inner}</div>`;
     if (p && p.g10 != null) {
-      return `<div class="psa"><span class="tag">PSA</span><span>9: <b>${num(p.g9)}</b></span><span>10: <b>${num(p.g10)}</b></span><button class="linkish" data-act="psa">edit</button></div>`;
+      return row(`<span>9: <b>${num(p.g9)}</b></span><span>10: <b>${num(p.g10)}</b></span><button class="linkish" data-act="psa">details</button>`);
     }
-    if (it.psaPending) return `<div class="psa"><span class="tag">PSA</span><span class="muted">Linked. Counts appear in a few minutes.</span></div>`;
-    if (p && p.error) return `<div class="psa"><span class="tag">PSA</span><span class="muted">Lookup failed (${esc(p.error)}).</span><button class="linkish" data-act="psa">Fix link</button></div>`;
-    if (p) return `<div class="psa"><span class="tag">PSA</span><span class="muted">Linked. Counts arrive with the next update.</span></div>`;
-    return `<div class="psa"><span class="tag">PSA</span><button class="linkish" data-act="psa">Link PSA 9/10 pop</button></div>`;
+    if (p && p.status === 'notfound') return row(`<span class="muted">No PSA copy found online yet. It will keep trying.</span><button class="linkish" data-act="psa">Enter cert</button>`);
+    if (p && p.status === 'error') return row(`<span class="muted">Lookup problem: ${esc(p.error || 'unknown')}</span><button class="linkish" data-act="psa">Fix</button>`);
+    if (p && p.status === 'waiting') return row(`<span class="muted">Waiting for eBay keys (see setup guide, step 9).</span>`);
+    if (!settings.ghToken) return row(`<span class="muted">Add a GitHub token in Settings to get PSA counts automatically.</span>`);
+    if (requested.has(key) || p) return row(`<span class="muted">Looking up PSA 9/10 pop… (a few minutes)</span>`);
+    return row(`<span class="muted">Queued for PSA lookup…</span>`);
+  }
+
+  // ---------- automatic PSA lookups ----------
+  // Each card+printing gets a key: "<pid>", "<pid>-rev" (reverse holo) or "<pid>-1st" (1st edition).
+  function psaKey(it) {
+    const p = String(it.printing || '').toLowerCase();
+    if (p.includes('reverse')) return `${it.pid}-rev`;
+    if (p.includes('1st')) return `${it.pid}-1st`;
+    return String(it.pid);
+  }
+  const requested = new Set(store.get('cs.requested', []));
+  let requestTimer = null;
+  let lastRequestAt = 0;
+
+  function queuePsa() {
+    if (!settings.ghToken || !settings.ghRepo) return;
+    clearTimeout(requestTimer);
+    requestTimer = setTimeout(sendPsaRequests, 1500);
+  }
+  async function sendPsaRequests() {
+    const want = {};
+    for (const it of list) {
+      if (!it.pid) continue;
+      const key = psaKey(it);
+      if (!requested.has(key) && !psa[key]) want[key] = { pid: it.pid, game: it.game };
+    }
+    if (!Object.keys(want).length) return;
+    try {
+      await updateRepoFile('psa-requests.json', (data) => Object.assign(data, want), 'Look up PSA population');
+      Object.keys(want).forEach((k) => requested.add(k));
+      store.set('cs.requested', [...requested]);
+      lastRequestAt = Date.now();
+      render();
+      startPolling();
+    } catch (e) {
+      showError('Could not request PSA counts: ' + e.message);
+    }
+  }
+
+  // While lookups are running on GitHub, check for new numbers every minute (for up to 20 minutes).
+  let pollTimer = null;
+  function startPolling() {
+    if (pollTimer) return;
+    pollTimer = setInterval(async () => {
+      const waiting = list.some((it) => requested.has(psaKey(it)) && !(psa[psaKey(it)] && psa[psaKey(it)].status && psa[psaKey(it)].status !== 'pending'));
+      if (!waiting || Date.now() - lastRequestAt > 20 * 60 * 1000) { clearInterval(pollTimer); pollTimer = null; return; }
+      if (document.visibilityState !== 'visible') return;
+      await loadPsa();
+      render();
+    }, 60 * 1000);
   }
 
   $('#list').addEventListener('click', (e) => {
@@ -142,7 +190,7 @@
     if (!it) return;
     const act = btn.dataset.act;
     if (act === 'remove') { list = list.filter((x) => x !== it); saveList(); render(); }
-    if (act === 'printing') { it.printing = btn.dataset.p; saveList(); render(); }
+    if (act === 'printing') { it.printing = btn.dataset.p; saveList(); render(); queuePsa(); }
     if (act === 'change') openPicker(it);
     if (act === 'psa') openPsa(it);
   });
@@ -265,6 +313,7 @@ If no card is visible, reply {"cards":[]}.`;
       }
     }
     busy('');
+    if (added) queuePsa();
     if (misses.length) showError(misses.join(' '));
     if (added) window.scrollTo({ top: 0, behavior: 'smooth' });
   }
@@ -323,13 +372,12 @@ If no card is visible, reply {"cards":[]}.`;
       pickTarget.game = game;
       pickTarget.pid = c.id;
       pickTarget.check = false;
-      pickTarget.psaPending = false;
       pickTarget.printing = M.pickPrinting(c.prices, pickTarget.detected?.finish, pickTarget.detected?.variant);
     } else {
       list.unshift({ uid: uid(), game, pid: c.id, added: Date.now(), detected: null, candidates: [c.id], check: false,
         printing: M.pickPrinting(c.prices, '', '') });
     }
-    saveList(); render(); dlgPick.close();
+    saveList(); render(); dlgPick.close(); queuePsa();
   });
   $('#btn-search').addEventListener('click', () => openPicker(null));
 
@@ -340,19 +388,22 @@ If no card is visible, reply {"cards":[]}.`;
   function b64encode(str) { return btoa(unescape(encodeURIComponent(str))); }
   function b64decode(b64) { return decodeURIComponent(escape(atob(b64.replace(/\s/g, '')))); }
 
-  async function updateLinks(mutate) {
+  // Read-modify-write a JSON file in your GitHub repository (retries once if two saves collide).
+  async function updateRepoFile(path, mutate, message, attempt = 0) {
     if (!settings.ghToken || !settings.ghRepo) throw new Error('Add your GitHub token and repository in Settings first.');
-    const url = `https://api.github.com/repos/${settings.ghRepo}/contents/psa-links.json`;
+    const url = `https://api.github.com/repos/${settings.ghRepo}/contents/${path}`;
     const headers = { Authorization: `Bearer ${settings.ghToken}`, Accept: 'application/vnd.github+json' };
     let sha, data = {};
     const r = await fetch(url, { headers, cache: 'no-store' });
     if (r.ok) { const j = await r.json(); sha = j.sha; data = JSON.parse(b64decode(j.content) || '{}'); }
+    else if (r.status === 401) throw new Error('GitHub rejected the token. Check it in Settings.');
     else if (r.status !== 404) throw new Error(`GitHub said ${r.status}. Check the token and repository name.`);
     mutate(data);
     const put = await fetch(url, {
       method: 'PUT', headers,
-      body: JSON.stringify({ message: 'Update PSA links', content: b64encode(JSON.stringify(data, null, 2) + '\n'), sha }),
+      body: JSON.stringify({ message, content: b64encode(JSON.stringify(data, null, 2) + '\n'), sha }),
     });
+    if ((put.status === 409 || put.status === 422) && attempt < 2) return updateRepoFile(path, mutate, message, attempt + 1);
     if (!put.ok) {
       let m = `GitHub said ${put.status}.`;
       try { m += ' ' + (await put.json()).message; } catch { /* keep */ }
@@ -363,11 +414,13 @@ If no card is visible, reply {"cards":[]}.`;
   function openPsa(item) {
     psaTarget = item;
     const c = cardOf(item);
-    $('#psa-card').textContent = c ? `${c.name} · ${c.set.name} · #${c.num}` : '';
-    const linked = psa[item.pid];
-    $('#psa-cert').value = linked ? linked.cert : '';
-    $('#psa-unlink').hidden = !linked;
-    $('#psa-msg').textContent = linked && linked.certDesc ? `Linked to PSA: ${linked.certDesc}` : '';
+    $('#psa-card').textContent = c ? `${c.name} · ${c.set.name} · #${c.num}${item.printing ? ' · ' + item.printing : ''}` : '';
+    const linked = psa[psaKey(item)];
+    $('#psa-cert').value = linked && linked.cert ? linked.cert : '';
+    $('#psa-unlink').hidden = !(linked && linked.source === 'manual');
+    $('#psa-msg').textContent = linked && linked.certDesc
+      ? `Matched to PSA: ${linked.certDesc}${linked.source === 'ebay' ? ' (found automatically). If that’s the wrong card, enter the right cert below.' : ''}`
+      : 'Normally found automatically. Only enter a cert if it can’t find one or picked the wrong card.';
     const q = c ? `PSA ${M.baseName(c.name)} ${c.num.split('/')[0]} ${c.set.name}` : 'PSA';
     $('#psa-find').href = `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(q)}`;
     dlgPsa.showModal();
@@ -377,10 +430,12 @@ If no card is visible, reply {"cards":[]}.`;
     const it = psaTarget;
     $('#psa-msg').textContent = 'Saving…';
     try {
-      await updateLinks((links) => { if (cert) links[String(it.pid)] = cert; else delete links[String(it.pid)]; });
-      for (const x of list) if (x.pid === it.pid) x.psaPending = !!cert;
-      if (!cert) delete psa[it.pid];
-      saveList(); render(); dlgPsa.close();
+      const key = psaKey(it);
+      await updateRepoFile('psa-links.json', (links) => { if (cert) links[key] = cert; else delete links[key]; }, 'Update PSA cert link');
+      delete psa[key];
+      requested.add(key); store.set('cs.requested', [...requested]);
+      lastRequestAt = Date.now(); startPolling();
+      render(); dlgPsa.close();
     } catch (e) {
       $('#psa-msg').textContent = e.message;
     }
@@ -412,6 +467,8 @@ If no card is visible, reply {"cards":[]}.`;
     store.set('cs.settings', settings);
     dlgSet.close();
     showError('');
+    render();
+    queuePsa();
   });
   $('#btn-clear').addEventListener('click', () => {
     if (!list.length || !confirm(`Remove all ${list.length} cards from the list?`)) return;
@@ -421,7 +478,7 @@ If no card is visible, reply {"cards":[]}.`;
     const rows = [['Name', 'Game', 'Set', 'Released', 'Number', 'Rarity', 'Printing', 'Market Price', 'PSA 9', 'PSA 10', 'TCGplayer']];
     for (const it of list) {
       const c = cardOf(it); if (!c) continue;
-      const p = psa[it.pid] || {};
+      const p = psa[psaKey(it)] || {};
       rows.push([c.name, GAME_LABEL[it.game], c.set.name, c.set.date, c.num, c.rarity, it.printing || '', marketOf(it, c) ?? '', p.g9 ?? '', p.g10 ?? '', `https://www.tcgplayer.com/product/${c.id}`]);
     }
     const csv = rows.map((r) => r.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\n');
@@ -442,13 +499,14 @@ If no card is visible, reply {"cards":[]}.`;
     const needed = [...new Set(list.map((i) => i.game))];
     await Promise.allSettled(needed.map(loadGame));
     render();
+    queuePsa();
     if (!settings.key) showError('Welcome! Open Settings (gear icon) and add your Claude AI API key to start scanning.');
     // Warm up the rest in the background so the first scan is quick.
     setTimeout(() => ['pokemon', 'onepiece', 'pokemon-jp'].forEach((g) => loadGame(g).catch(() => {})), 1500);
   }
   // Pick up fresh PSA numbers when the app comes back to the foreground.
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible' && list.some((i) => i.psaPending)) loadPsa().then(render);
+    if (document.visibilityState === 'visible') loadPsa().then(render);
   });
 
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});

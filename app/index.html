@@ -75,11 +75,11 @@
   <!-- PSA link -->
   <dialog id="dlg-psa" class="sheet">
     <form method="dialog" class="sheet-head">
-      <h2>Link PSA population</h2>
+      <h2>PSA population</h2>
       <button class="icon-btn" aria-label="Close">✕</button>
     </form>
     <p id="psa-card" class="small"></p>
-    <p class="small muted">PSA can't be searched by card name, so link this card once using the <strong>cert number of any PSA-graded copy of this exact card</strong>. eBay listing photos show it on the slab label. After that, PSA 9 and 10 counts update on their own.</p>
+    <p class="small muted">The app finds a PSA-graded copy of this card on eBay by itself and uses its cert number to get PSA's counts. If it picked the wrong card or can't find one, you can enter a cert number here instead.</p>
     <div class="row">
       <input id="psa-cert" inputmode="numeric" placeholder="PSA cert number, e.g. 87654321">
     </div>
@@ -87,7 +87,7 @@
       <a id="psa-find" class="btn secondary small-btn" target="_blank" rel="noopener">Find a graded copy on eBay</a>
     </div>
     <div class="row end">
-      <button id="psa-unlink" class="btn ghost" hidden>Unlink</button>
+      <button id="psa-unlink" class="btn ghost" hidden>Use automatic</button>
       <button id="psa-save" class="btn primary">Save link</button>
     </div>
     <p id="psa-msg" class="small"></p>
@@ -109,7 +109,7 @@
         <option value="claude-opus-5-5">Opus 5.5 (most accurate)</option>
       </select>
     </label>
-    <label class="field">GitHub token <span class="muted">(only for linking PSA)</span>
+    <label class="field">GitHub token <span class="muted">(for automatic PSA counts)</span>
       <input id="set-gh" type="password" autocomplete="off" placeholder="github_pat_…">
     </label>
     <label class="field">GitHub repository
