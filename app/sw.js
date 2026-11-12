@@ -1,6 +1,6 @@
 // Offline support: app files load instantly from cache and refresh in the background;
 // price data always tries the network first so you see the newest prices.
-const CACHE = 'card-scanner-v6';
+const CACHE = 'card-scanner-v7';
 const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'matcher.js', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-180.png'];
 
 self.addEventListener('install', (e) => {

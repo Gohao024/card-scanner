@@ -119,20 +119,171 @@
   }
 
   function psaHtml(it) {
-    const key = psaKey(it);
-    const p = psa[key];
+    const c = cardOf(it);
+    if (!c) return '';
     const row = (inner) => `<div class="psa"><span class="tag">PSA</span>${inner}</div>`;
-    if (p && p.g10 != null) {
-      return row(`<span>9: <b>${num(p.g9)}</b></span><span>10: <b>${num(p.g10)}</b></span><button class="linkish" data-act="psa">details</button>`);
+    const key = setKey(it.game, c);
+    const link = setLinks[key];
+    if (link && link.url) {
+      return row(`<a class="btn secondary pop-btn" href="${esc(link.url)}" target="_blank" rel="noopener">Pop report: ${esc(c.set.name)} ↗</a><button class="linkish" data-act="setlink">change link</button>`);
     }
-    if (searching.has(key)) return row(`<span class="muted">Finding this card on PSA’s website…</span>`);
-    const fresh = searched[key] && (!p || !p.checked || searched[key] > Date.parse(p.checked));
-    if (p && p.status === 'notfound' && fresh) return row(`<span class="muted">Looking up PSA 9/10 pop… (a few minutes)</span>`);
-    if (p && p.status === 'notfound') return row(`<span class="muted">Not found on PSA’s website yet. Tries again in about 10 days.</span><button class="linkish" data-act="psa">Enter cert</button>`);
-    if (p && p.status === 'error') return row(`<span class="muted">Lookup problem: ${esc(p.error || 'unknown')}</span><button class="linkish" data-act="psa">Fix</button>`);
-    if (!settings.ghToken) return row(`<span class="muted">Add a GitHub token in Settings to get PSA counts automatically.</span>`);
-    if (requested.has(key) || p) return row(`<span class="muted">Looking up PSA 9/10 pop… (a few minutes)</span>`);
-    return row(`<span class="muted">Queued for PSA lookup…</span>`);
+    if (setSearching.has(key)) return row(`<span class="muted">Finding this set’s PSA pop report…</span>`);
+    return row(`<a class="btn secondary pop-btn" href="${esc(fallbackSearch(it.game, c))}" target="_blank" rel="noopener">Find PSA pop report ↗</a><button class="linkish" data-act="setlink">paste link</button>`);
+  }
+
+  // ---------- PSA population report links (one per set) ----------
+  // PSA's set reports live at https://www.psacard.com/pop/tcg-cards/<year>/<set-name>/<id>.
+  // The id can't be worked out from the set name, so the app finds each set's page once
+  // (web search limited to psacard.com), checks it, and remembers it in psa-sets.json in your repo.
+  const SET_FILE = 'psa-sets.json';
+  const setLinks = store.get('cs.setLinks', {});      // "<game>:<TCGplayer set id>" -> {url, title, by}
+  const setTried = store.get('cs.setTried', {});      // when a set was last searched for
+  const setSearching = new Set();
+  const SET_RETRY_MS = 7 * 24 * 3600 * 1000;
+  const POP_URL_RE = /^https?:\/\/(?:www\.)?psacard\.com\/pop\/tcg-cards\/(\d{4})\/([a-z0-9-]+)\/(\d+)\/?(?:[?#].*)?$/i;
+  const GENERIC = new Set(['pokemon', 'one', 'piece', 'the', 'and', 'of', 'card', 'cards', 'game', 'tcg', 'sv', 'sm', 'swsh', 'xy', 'bw', 'dp', 'hgss', 'set', 'series', 'en', 'english', 'collection', 'promo', 'promos', 'booster', 'pack', 'extra']);
+
+  function setKey(game, c) { return `${game}:${c.set.id}`; }
+  function cleanSetName(name) { return String(name || '').replace(/^[A-Z0-9]+\s*[:\-]\s*/i, '').trim() || String(name || ''); }
+  function fallbackSearch(game, c) {
+    const year = (c.set.date || '').slice(0, 4);
+    const q = `site:psacard.com/pop ${year} ${game === 'onepiece' ? 'one piece' : 'pokemon'}${game === 'pokemon-jp' ? ' japanese' : ''} ${cleanSetName(c.set.name)}`;
+    return `https://www.google.com/search?q=${encodeURIComponent(q)}`;
+  }
+  function normalizePopUrl(url) {
+    const m = String(url || '').trim().match(POP_URL_RE);
+    return m ? { url: `https://www.psacard.com/pop/tcg-cards/${m[1]}/${m[2].toLowerCase()}/${m[3]}`, year: +m[1], slug: m[2].toLowerCase() } : null;
+  }
+  // Is this PSA set page plausibly the right set? (year, game, language, set name)
+  function plausibleSet(n, game, c) {
+    const year = +(c.set.date || '').slice(0, 4);
+    if (year && Math.abs(n.year - year) > 1) return false;
+    if (game === 'onepiece' ? !n.slug.includes('one-piece') : !n.slug.includes('pokemon')) return false;
+    if (n.slug.includes('japanese') !== (game === 'pokemon-jp')) return false;
+    const words = M.normText(c.set.name).split(' ').filter((w) => w.length >= 3 && !GENERIC.has(w));
+    const slugWords = new Set(n.slug.split('-'));
+    return !words.length || words.some((w) => slugWords.has(w) || n.slug.includes(w));
+  }
+
+  async function loadSetLinks() {
+    if (!settings.ghRepo) return;
+    try {
+      const r = await fetch(`https://raw.githubusercontent.com/${settings.ghRepo}/main/${SET_FILE}?t=${Date.now()}`, { cache: 'no-store' });
+      if (!r.ok) return;
+      const remote = await r.json();
+      for (const [k, v] of Object.entries(remote || {})) if (v && v.url && !(setLinks[k] && setLinks[k].by === 'you' && !v.by)) setLinks[k] = v;
+      store.set('cs.setLinks', setLinks);
+    } catch { /* offline or no file yet */ }
+  }
+  async function saveSetLink(key, link) {
+    setLinks[key] = link;
+    store.set('cs.setLinks', setLinks);
+    render();
+    if (settings.ghToken && settings.ghRepo) {
+      try { await updateRepoFile(SET_FILE, (d) => { d[key] = link; }, 'Remember PSA pop report link'); }
+      catch (e) { showError('Saved the PSA link on this phone, but not to GitHub: ' + e.message); }
+    }
+  }
+
+  async function findSetPage(game, c, sample) {
+    const year = (c.set.date || '').slice(0, 4);
+    const gameText = game === 'onepiece' ? 'One Piece Card Game (English)'
+      : game === 'pokemon-jp' ? 'Pokémon (Japanese; PSA puts "japanese" in the set name)' : 'Pokémon (English)';
+    const prompt = `Find the PSA population report page for this trading card set on psacard.com.
+Its address looks like https://www.psacard.com/pop/tcg-cards/2019/pokemon-sun-moon-cosmic-eclipse/171151 (year / set name / number).
+- Game: ${gameText}
+- Set: ${c.set.name}${c.set.abbr ? ` (set code ${c.set.abbr})` : ''}
+- Released: ${c.set.date || 'unknown'}
+- A card in this set: ${sample.name} #${sample.num}
+Search, for example: psacard pop tcg-cards ${year} ${game === 'onepiece' ? 'one piece' : 'pokemon'} ${cleanSetName(c.set.name)}
+Only give an address you actually saw. Never make one up.
+Reply with ONLY this JSON: {"url":"https://www.psacard.com/pop/tcg-cards/...","title":"..."} or {"url":""} if you didn't find it.`;
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': settings.key,
+        'anthropic-version': '2023-06-01',
+        'anthropic-dangerous-direct-browser-access': 'true',
+      },
+      body: JSON.stringify({
+        model: 'claude-haiku-5-5',
+        max_tokens: 600,
+        tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 3, allowed_domains: ['psacard.com'] }],
+        messages: [{ role: 'user', content: prompt }],
+      }),
+    });
+    if (!r.ok) {
+      let msg = `HTTP ${r.status}`;
+      try { msg = (await r.json()).error.message || msg; } catch { /* keep */ }
+      throw new Error(msg);
+    }
+    const j = await r.json();
+    const text = (j.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('\n');
+    const o = extractJson(text, 'url');
+    const n = o && normalizePopUrl(o.url);
+    if (n && plausibleSet(n, game, c)) return { url: n.url, title: String(o.title || '').slice(0, 120), by: 'search' };
+    // Also accept a matching pop-report address mentioned anywhere in the reply.
+    for (const m of text.match(/https?:\/\/(?:www\.)?psacard\.com\/pop\/tcg-cards\/\d{4}\/[a-z0-9-]+\/\d+/gi) || []) {
+      const n2 = normalizePopUrl(m);
+      if (n2 && plausibleSet(n2, game, c)) return { url: n2.url, title: '', by: 'search' };
+    }
+    return null;
+  }
+
+  let setTimer = null;
+  function queuePsa() {
+    clearTimeout(setTimer);
+    setTimer = setTimeout(findMissingSets, 800);
+  }
+  let findingSets = false;
+  async function findMissingSets() {
+    if (findingSets || !settings.key) return;
+    const todo = new Map();
+    for (const it of list) {
+      const c = cardOf(it);
+      if (!c) continue;
+      const key = setKey(it.game, c);
+      if (setLinks[key] || todo.has(key)) continue;
+      if (Date.now() - (setTried[key] || 0) < SET_RETRY_MS) continue;
+      todo.set(key, { game: it.game, c });
+    }
+    if (!todo.size) return;
+    findingSets = true;
+    try {
+      for (const [key, { game, c }] of todo) {
+        setSearching.add(key); render();
+        try {
+          const link = await findSetPage(game, c, c);
+          setTried[key] = Date.now(); store.set('cs.setTried', setTried);
+          if (link) await saveSetLink(key, link);
+        } catch (e) {
+          showError('Couldn’t look up the PSA pop report: ' + e.message);
+          break;
+        } finally {
+          setSearching.delete(key); render();
+        }
+      }
+    } finally { findingSets = false; }
+  }
+
+  function pasteSetLink(it) {
+    const c = cardOf(it);
+    if (!c) return;
+    const key = setKey(it.game, c);
+    const current = setLinks[key] ? setLinks[key].url : '';
+    const v = prompt(`Paste the PSA pop report link for “${c.set.name}”.\nIt looks like: https://www.psacard.com/pop/tcg-cards/2019/pokemon-sun-moon-cosmic-eclipse/171151\n(Leave empty to search again.)`, current);
+    if (v === null) return;
+    if (!v.trim()) {
+      delete setLinks[key]; delete setTried[key];
+      store.set('cs.setLinks', setLinks); store.set('cs.setTried', setTried);
+      if (settings.ghToken && settings.ghRepo) updateRepoFile(SET_FILE, (d) => { delete d[key]; }, 'Forget PSA pop report link').catch(() => {});
+      render(); queuePsa();
+      return;
+    }
+    const n = normalizePopUrl(v);
+    if (!n) { alert('That doesn’t look like a PSA pop report link. It should start with https://www.psacard.com/pop/tcg-cards/'); return; }
+    saveSetLink(key, { url: n.url, title: '', by: 'you' });
   }
 
   // ---------- automatic PSA lookups ----------
@@ -147,11 +298,7 @@
   let requestTimer = null;
   let lastRequestAt = 0;
 
-  function queuePsa() {
-    if (!settings.ghToken || !settings.ghRepo) return;
-    clearTimeout(requestTimer);
-    requestTimer = setTimeout(sendPsaRequests, 1500);
-  }
+  // (Per-card PSA count lookups are paused; queuePsa() above now finds set pop-report links.)
   // When each card was last searched for on PSA's site (so "not found" cards retry every ~10 days).
   const searched = store.get('cs.searched2', {});
   const RETRY_MS = 10 * 24 * 3600 * 1000;
@@ -320,6 +467,7 @@ or {"pages":[]} if you found no matching PSA page.`;
     if (act === 'printing') { it.printing = btn.dataset.p; saveList(); render(); queuePsa(); }
     if (act === 'change') openPicker(it);
     if (act === 'psa') openPsa(it);
+    if (act === 'setlink') pasteSetLink(it);
   });
 
   // ---------- scanning ----------
@@ -650,11 +798,10 @@ If no card is visible, reply {"cards":[]}.`;
     list = []; saveList(); render(); dlgSet.close();
   });
   $('#btn-export').addEventListener('click', async () => {
-    const rows = [['Name', 'Game', 'Set', 'Released', 'Number', 'Rarity', 'Printing', 'Market Price', 'PSA 9', 'PSA 10', 'TCGplayer']];
+    const rows = [['Name', 'Game', 'Set', 'Released', 'Number', 'Rarity', 'Printing', 'Market Price', 'PSA pop report', 'TCGplayer']];
     for (const it of list) {
       const c = cardOf(it); if (!c) continue;
-      const p = psa[psaKey(it)] || {};
-      rows.push([c.name, GAME_LABEL[it.game], c.set.name, c.set.date, c.num, c.rarity, it.printing || '', marketOf(it, c) ?? '', p.g9 ?? '', p.g10 ?? '', `https://www.tcgplayer.com/product/${c.id}`]);
+      rows.push([c.name, GAME_LABEL[it.game], c.set.name, c.set.date, c.num, c.rarity, it.printing || '', marketOf(it, c) ?? '', (setLinks[setKey(it.game, c)] || {}).url || '', `https://www.tcgplayer.com/product/${c.id}`]);
     }
     const csv = rows.map((r) => r.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\n');
     const name = `cards-${new Date().toISOString().slice(0, 10)}.csv`;
@@ -670,7 +817,7 @@ If no card is visible, reply {"cards":[]}.`;
   // ---------- start ----------
   async function start() {
     render();
-    await Promise.all([loadMeta(), loadPsa()]);
+    await Promise.all([loadMeta(), loadSetLinks()]);
     const needed = [...new Set(list.map((i) => i.game))];
     await Promise.allSettled(needed.map(loadGame));
     render();

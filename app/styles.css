@@ -150,3 +150,5 @@ hr { border: 0; border-top: 1px solid var(--line); margin: 16px 0; }
 .secret { -webkit-text-security: disc; font-family: ui-monospace, Menlo, monospace; }
 .secret.shown { -webkit-text-security: none; }
 #set-test-out { white-space: pre-line; }
+
+.pop-btn { padding: 7px 10px; font-size: 13px; border-radius: 9px; max-width: 100%; text-align: left; }
