@@ -60,6 +60,10 @@ class OutOfCalls(Exception):
     pass
 
 
+class TokenRejected(Exception):
+    pass
+
+
 def log(*a):
     print(*a, flush=True)
 
@@ -181,7 +185,8 @@ class PSA:
             data = http_json(f"{PSA_API}{path}", {"Authorization": f"Bearer {self.token}"})
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
-                raise SystemExit(f"PSA rejected the token (HTTP {e.code}). Check the PSA_TOKEN secret.")
+                raise TokenRejected(f"PSA rejected the PSA_TOKEN secret (HTTP {e.code}). Copy a fresh token "
+                                    "from psacard.com/publicapi into the GitHub secret.")
             if e.code == 429:
                 self.calls_left = 0
                 raise OutOfCalls("PSA says the daily limit is reached")
@@ -569,13 +574,21 @@ def main():
                               "checked": now().isoformat(timespec="seconds")})
                     e.pop("error", None)
                     log(f"  {key} {card['name']}: PSA 9={e.get('g9')} PSA 10={e.get('g10')} ({e.get('certDesc')})")
-                except OutOfCalls:
+                except (OutOfCalls, TokenRejected):
                     raise
                 except Exception as ex:
                     e.update({"status": "error", "error": str(ex)[:200], "checked": now().isoformat(timespec="seconds")})
                     log(f"  {key}: {ex}")
         except OutOfCalls as q:
             log(f"Stopped: {q}. The rest continue on the next run.")
+        except TokenRejected as t:
+            # Don't fail the whole publish: prices and the app still go out, and each waiting
+            # card shows the reason in the app.
+            log(f"::error::{t}")
+            for key in todo:
+                e = cards_out.setdefault(key, {})
+                if e.get("g10") is None:
+                    e.update({"status": "error", "error": str(t), "checked": now().isoformat(timespec="seconds")})
         used_today += psa.used
 
     # Anything still not looked up shows as "pending" in the app.
